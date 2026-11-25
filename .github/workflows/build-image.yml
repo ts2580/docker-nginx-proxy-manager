@@ -5,7 +5,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DOCKER_IMAGE_NAME: jlesage/nginx-proxy-manager
+  DOCKER_IMAGE_NAME: trstyq/nginx-proxy-manager
   PLATFORMS: linux/amd64,linux/386,linux/arm/v6,linux/arm/v7,linux/arm64/v8
 
 on:
@@ -18,6 +18,9 @@ on:
 
 jobs:
   build:
+    permissions:
+      contents: read
+      packages: write
     name: Build image
     runs-on: ubuntu-22.04
 
@@ -57,12 +60,14 @@ jobs:
             # Do not include the starting 'v' of the version.
             LABEL_VERSION=${VERSION:1}
           fi
-          # Determine the Docker container tags.
-          TAGS="${{ env.DOCKER_IMAGE_NAME }}:${VERSION}"
+          # Docker Hub and GitHub use different owners for this fork.
+          name="${GITHUB_REPOSITORY#*/}"
+          name="${name#docker-}"
+          GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name}"
+          TAGS="${DOCKER_IMAGE_NAME}:${VERSION},${GHCR_IMAGE}:${VERSION}"
           if [[ $GITHUB_REF =~ refs/tags/* ]]; then
-            TAGS="$TAGS,${{ env.DOCKER_IMAGE_NAME }}:latest"
+            TAGS="$TAGS,${DOCKER_IMAGE_NAME}:latest,${GHCR_IMAGE}:latest"
           fi
-          TAGS="$TAGS,$(echo $TAGS | tr ',' '\n' | sed 's|^|ghcr.io/|' | tr '\n' ',')"
           # Determine the release type.
           if [[ $GITHUB_REF =~ refs/tags/* ]]; then
               IS_RELEASE=yes
@@ -76,9 +81,7 @@ jobs:
               RELEASE_TYPE="n/a"
           fi
           # Determine the Docker cache image.
-          name="${GITHUB_REPOSITORY#*/}"
-          name="${name#docker-}"
-          CACHE_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${name}:buildcache"
+          CACHE_IMAGE="${GHCR_IMAGE}:buildcache"
           # Print results.
           echo "::group::Results"
           echo "Github reference: $GITHUB_REF"
@@ -90,13 +93,14 @@ jobs:
           echo "Docker cache image: $CACHE_IMAGE"
           echo "::endgroup::"
           # Export outputs.
-          echo "is_release=${IS_RELEASE}" >> $GITHUB_OUTPUT
-          echo "release_type=${RELEASE_TYPE}" >> $GITHUB_OUTPUT
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "label_version=${LABEL_VERSION}" >> $GITHUB_OUTPUT
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-          echo "CACHE_IMAGE=${CACHE_IMAGE}" >> $GITHUB_ENV
-          #echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+          {
+            echo "is_release=${IS_RELEASE}"
+            echo "release_type=${RELEASE_TYPE}"
+            echo "version=${VERSION}"
+            echo "label_version=${LABEL_VERSION}"
+            echo "tags=${TAGS}"
+          } >> "$GITHUB_OUTPUT"
+          echo "CACHE_IMAGE=${CACHE_IMAGE}" >> "$GITHUB_ENV"
 
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v4
@@ -130,7 +134,7 @@ jobs:
           build-args: |
             DOCKER_IMAGE_VERSION=${{ steps.prep.outputs.label_version }}
           cache-from: type=registry,ref=${{ env.CACHE_IMAGE }}
-          cache-to: ${{ github.ref == 'refs/heads/master' && format('type=registry,ref={0},mode=max', env.CACHE_IMAGE) || '' }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=registry,ref={0},mode=max', env.CACHE_IMAGE) || '' }}
 
       - name: Inspect
         if: ${{ steps.prep.outputs.is_release == 'yes' }}
@@ -156,8 +160,12 @@ jobs:
     runs-on: ubuntu-22.04
     if: ${{ always() && github.event_name != 'pull_request' }}
 
+    env:
+      PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+      PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
     steps:
       - name: Pushover notification
+        if: ${{ env.PUSHOVER_API_TOKEN != '' && env.PUSHOVER_USER_KEY != '' }}
         uses: desiderati/github-action-pushover@v1
         with:
           job-status: ${{ needs.build.result }}
