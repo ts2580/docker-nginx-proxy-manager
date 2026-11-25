@@ -1,14 +1,18 @@
 # Docker container for Nginx Proxy Manager
-[![Release](https://img.shields.io/github/release/jlesage/docker-nginx-proxy-manager.svg?logo=github&style=for-the-badge)](https://github.com/jlesage/docker-nginx-proxy-manager/releases/latest)
-[![Docker Image Size](https://img.shields.io/docker/image-size/jlesage/nginx-proxy-manager/latest?logo=docker&style=for-the-badge)](https://hub.docker.com/r/jlesage/nginx-proxy-manager/tags)
-[![Docker Pulls](https://img.shields.io/docker/pulls/jlesage/nginx-proxy-manager?label=Pulls&logo=docker&style=for-the-badge)](https://hub.docker.com/r/jlesage/nginx-proxy-manager)
-[![Docker Stars](https://img.shields.io/docker/stars/jlesage/nginx-proxy-manager?label=Stars&logo=docker&style=for-the-badge)](https://hub.docker.com/r/jlesage/nginx-proxy-manager)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/jlesage/docker-nginx-proxy-manager/build-image.yml?logo=github&branch=master&style=for-the-badge)](https://github.com/jlesage/docker-nginx-proxy-manager/actions/workflows/build-image.yml)
-[![Source](https://img.shields.io/badge/Source-GitHub-blue?logo=github&style=for-the-badge)](https://github.com/jlesage/docker-nginx-proxy-manager)
+[![Release](https://img.shields.io/github/release/ts2580/docker-nginx-proxy-manager.svg?logo=github&style=for-the-badge)](https://github.com/ts2580/docker-nginx-proxy-manager/releases/latest)
+[![Docker Image Size](https://img.shields.io/docker/image-size/trstyq/nginx-proxy-manager/latest?logo=docker&style=for-the-badge)](https://hub.docker.com/r/trstyq/nginx-proxy-manager/tags)
+[![Docker Pulls](https://img.shields.io/docker/pulls/trstyq/nginx-proxy-manager?label=Pulls&logo=docker&style=for-the-badge)](https://hub.docker.com/r/trstyq/nginx-proxy-manager)
+[![Docker Stars](https://img.shields.io/docker/stars/trstyq/nginx-proxy-manager?label=Stars&logo=docker&style=for-the-badge)](https://hub.docker.com/r/trstyq/nginx-proxy-manager)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/ts2580/docker-nginx-proxy-manager/build-image.yml?logo=github&branch=main&style=for-the-badge)](https://github.com/ts2580/docker-nginx-proxy-manager/actions/workflows/build-image.yml)
+[![Source](https://img.shields.io/badge/Source-GitHub-blue?logo=github&style=for-the-badge)](https://github.com/ts2580/docker-nginx-proxy-manager)
 [![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg?style=for-the-badge)](https://paypal.me/JocelynLeSage)
 
 This project provides a lightweight and secure Docker container for
 [Nginx Proxy Manager](https://nginxproxymanager.com).
+
+This fork of [jlesage's container](https://github.com/jlesage/docker-nginx-proxy-manager)
+adds **Replace Certificate** to the actions menu for custom certificates. Replacing
+a certificate updates every host that uses it.
 
 > This Docker container is entirely unofficial and not made by the creators of
 > Nginx Proxy Manager.
@@ -37,7 +41,7 @@ docker run -d \
     -p 8080:8080 \
     -p 4443:4443 \
     -v /docker/appdata/nginx-proxy-manager:/config:rw \
-    jlesage/nginx-proxy-manager
+    trstyq/nginx-proxy-manager
 ```
 
 Where:
@@ -48,7 +52,7 @@ Access the Nginx Proxy Manager GUI by browsing to `http://your-host-ip:8181`.
 
 ## Documentation
 
-Full documentation is available at https://github.com/jlesage/docker-nginx-proxy-manager.
+Full documentation is available at https://github.com/ts2580/docker-nginx-proxy-manager.
 
 ## Support or Contact
 

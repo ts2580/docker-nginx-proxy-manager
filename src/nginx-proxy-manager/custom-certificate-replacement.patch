@@ -1,0 +1,681 @@
+diff --git a/backend/internal/audit-log.js b/backend/internal/audit-log.js
+index 5155028..556131a 100644
+--- a/backend/internal/audit-log.js
++++ b/backend/internal/audit-log.js
+@@ -74,7 +74,7 @@ const internalAuditLog = {
+ 	 * @param   {Object}   [data.meta]
+ 	 * @returns {Promise}
+ 	 */
+-	add: async (access, data) => {
++	add: async (access, data, trx) => {
+ 		if (typeof data.user_id === "undefined" || !data.user_id) {
+ 			data.user_id = access.token.getUserId(1);
+ 		}
+@@ -84,7 +84,7 @@ const internalAuditLog = {
+ 		}
+ 
+ 		// Make sure at least 1 of the IDs are set and action
+-		return await auditLogModel.query().insert({
++		return await auditLogModel.query(trx).insert({
+ 			user_id: data.user_id,
+ 			action: data.action,
+ 			object_type: data.object_type || "",
+diff --git a/backend/internal/certificate.js b/backend/internal/certificate.js
+index beced02..ae56874 100644
+--- a/backend/internal/certificate.js
++++ b/backend/internal/certificate.js
+@@ -16,6 +16,7 @@ import certificateModel from "../models/certificate.js";
+ import tokenModel from "../models/token.js";
+ import userModel from "../models/user.js";
+ import internalAuditLog from "./audit-log.js";
++import { withCustomCertificateFiles } from "./custom-certificate-files.js";
+ import internalHost from "./host.js";
+ import internalNginx from "./nginx.js";
+ 
+@@ -184,6 +185,8 @@ const omissions = () => {
+ 	return ["is_deleted", "owner.is_deleted", "meta.dns_provider_credentials", "meta.certificate_key"];
+ };
+ 
++const pendingUploads = new Set();
++
+ const internalCertificate = {
+ 	allowedSslFiles: ["certificate", "certificate_key", "intermediate_certificate"],
+ 	intervalTimeout: 1000 * 60 * 60, // 1 hour
+@@ -401,49 +404,6 @@ const internalCertificate = {
+ 		});
+ 	},
+ 
+-	/**
+-	 * @param  {Access}  access
+-	 * @param  {Object}  data
+-	 * @param  {Number}  data.id
+-	 * @param  {String}  [data.email]
+-	 * @param  {String}  [data.name]
+-	 * @return {Promise}
+-	 */
+-	update: async (access, data) => {
+-		await access.can("certificates:update", data.id);
+-		const row = await internalCertificate.get(access, { id: data.id });
+-
+-		if (row.id !== data.id) {
+-			// Sanity check that something crazy hasn't happened
+-			throw new error.InternalValidationError(
+-				`Certificate could not be updated, IDs do not match: ${row.id} !== ${data.id}`,
+-			);
+-		}
+-
+-		const savedRow = await certificateModel
+-			.query()
+-			.patchAndFetchById(row.id, data)
+-			.then(utils.omitRow(omissions()));
+-
+-		savedRow.meta = internalCertificate.cleanMeta(savedRow.meta);
+-		data.meta = internalCertificate.cleanMeta(data.meta);
+-
+-		// Add row.nice_name for custom certs
+-		if (savedRow.provider === "other") {
+-			data.nice_name = savedRow.nice_name;
+-		}
+-
+-		// Add to audit log
+-		await internalAuditLog.add(access, {
+-			action: "updated",
+-			object_type: "certificate",
+-			object_id: row.id,
+-			meta: _.omit(data, ["expires_on"]), // this prevents json circular reference because expires_on might be raw
+-		});
+-
+-		return savedRow;
+-	},
+-
+ 	/**
+ 	 * @param  {Access}   access
+ 	 * @param  {Object}   data
+@@ -703,55 +663,6 @@ const internalCertificate = {
+ 		return Number.parseInt(row.count, 10);
+ 	},
+ 
+-	/**
+-	 * @param   {Object} certificate
+-	 * @returns {Promise}
+-	 */
+-	writeCustomCert: async (certificate) => {
+-		logger.info("Writing Custom Certificate:", certificate);
+-
+-		const dir = `/data/custom_ssl/npm-${certificate.id}`;
+-
+-		return new Promise((resolve, reject) => {
+-			if (certificate.provider === "letsencrypt") {
+-				reject(new Error("Refusing to write letsencrypt certs here"));
+-				return;
+-			}
+-
+-			let certData = certificate.meta.certificate;
+-			if (typeof certificate.meta.intermediate_certificate !== "undefined") {
+-				certData = `${certData}\n${certificate.meta.intermediate_certificate}`;
+-			}
+-
+-			try {
+-				if (!fs.existsSync(dir)) {
+-					fs.mkdirSync(dir);
+-				}
+-			} catch (err) {
+-				reject(err);
+-				return;
+-			}
+-
+-			fs.writeFile(`${dir}/fullchain.pem`, certData, (err) => {
+-				if (err) {
+-					reject(err);
+-				} else {
+-					resolve();
+-				}
+-			});
+-		}).then(() => {
+-			return new Promise((resolve, reject) => {
+-				fs.writeFile(`${dir}/privkey.pem`, certificate.meta.certificate_key, (err) => {
+-					if (err) {
+-						reject(err);
+-					} else {
+-						resolve();
+-					}
+-				});
+-			});
+-		});
+-	},
+-
+ 	/**
+ 	 * @param   {Access}   access
+ 	 * @param   {Object}   data
+@@ -820,6 +731,19 @@ const internalCertificate = {
+ 	 * @returns {Promise}
+ 	 */
+ 	upload: async (access, data) => {
++		await access.can("certificates:update", data.id);
++		if (pendingUploads.has(data.id)) {
++			throw new error.ValidationError("Another upload is in progress for this certificate");
++		}
++		pendingUploads.add(data.id);
++		try {
++			return await internalCertificate.uploadFiles(access, data);
++		} finally {
++			pendingUploads.delete(data.id);
++		}
++	},
++
++	uploadFiles: async (access, data) => {
+ 		const row = await internalCertificate.get(access, { id: data.id });
+ 		if (row.provider !== "other") {
+ 			throw new error.ValidationError("Cannot upload certificates for this type of provider");
+@@ -830,11 +754,12 @@ const internalCertificate = {
+ 			throw new error.ValidationError("Certificate file was not provided");
+ 		}
+ 
+-		// row came through get(), which omits meta.certificate_key so it never goes out over
+-		// the API. update() replaces meta wholesale, so build on the stored meta (read from the
+-		// model directly) or an upload without a key would erase the stored one.
+-		const stored = await certificateModel.query().where("id", row.id).first();
+-		const meta = { ...(stored?.meta || {}) };
++		// get() redacts the key. A certificate-only renewal must compare against the stored key.
++		const stored = await certificateModel.query().findById(row.id);
++		const meta = { ...stored.meta };
++		if (data.replaceChain) {
++			delete meta.intermediate_certificate;
++		}
+ 		const uploaded = [];
+ 
+ 		_.map(data.files, (file, name) => {
+@@ -844,8 +769,6 @@ const internalCertificate = {
+ 			}
+ 		});
+ 
+-		// Fail before anything is written: without a key, writeCustomCert would overwrite
+-		// fullchain.pem and then fail on privkey.pem, leaving nginx with a mismatched pair.
+ 		if (!meta.certificate_key) {
+ 			throw new error.ValidationError("Certificate Key file was not provided");
+ 		}
+@@ -853,15 +776,48 @@ const internalCertificate = {
+ 		// together; a mismatch would make nginx -t fail for every host on the next reload.
+ 		await internalCertificate.checkKeyMatchesCertificate(meta.certificate, meta.certificate_key);
+ 
+-		const certificate = await internalCertificate.update(access, {
+-			id: data.id,
+-			expires_on: moment(validations.certificate.dates.to, "X").format("YYYY-MM-DD HH:mm:ss"),
+-			domain_names: validations.certificate.cn ? [validations.certificate.cn] : [],
+-			meta: _.clone(meta), // Prevent the update method from changing this value that we'll use later
+-		});
+-
+-		certificate.meta = meta;
+-		await internalCertificate.writeCustomCert(certificate);
++		const domainNames = validations.certificate.cn ? [validations.certificate.cn] : [];
++		const expiresOn = moment(validations.certificate.dates.to, "X").format("YYYY-MM-DD HH:mm:ss");
++		let reloaded = false;
++		await withCustomCertificateFiles(
++			`/data/custom_ssl/npm-${row.id}`,
++			meta,
++			() =>
++				certificateModel.transaction(async (trx) => {
++					const count = await certificateModel.query(trx).where({ id: row.id, is_deleted: 0 }).patch({
++						domain_names: domainNames,
++						expires_on: expiresOn,
++						meta,
++					});
++					if (!count) {
++						throw new error.ItemNotFoundError(row.id);
++					}
++					await internalAuditLog.add(
++						access,
++						{
++							action: "updated",
++							object_type: "certificate",
++							object_id: row.id,
++							meta: {
++								id: row.id,
++								nice_name: row.nice_name,
++								domain_names: domainNames,
++								meta: internalCertificate.cleanMeta({ ...meta }),
++							},
++						},
++						trx,
++					);
++					if (stored.meta.certificate || data.replaceChain) {
++						await internalNginx.reload();
++						reloaded = true;
++					}
++				}),
++			async () => {
++				if (reloaded) {
++					await internalNginx.reload();
++				}
++			},
++		);
+ 		// Only echo back what was uploaded in this request, never the stored key
+ 		return _.pick(meta, uploaded);
+ 	},
+diff --git a/backend/internal/custom-certificate-files.js b/backend/internal/custom-certificate-files.js
+new file mode 100644
+index 0000000..0867641
+--- /dev/null
++++ b/backend/internal/custom-certificate-files.js
+@@ -0,0 +1,46 @@
++import fs from "node:fs";
++import path from "node:path";
++
++// Keep both original PEMs available until nginx and the database have accepted the upload.
++export async function withCustomCertificateFiles(dir, meta, apply, afterRestore) {
++	fs.mkdirSync(dir, { recursive: true });
++	const staging = fs.mkdtempSync(path.join(dir, ".upload-"));
++	const files = {
++		"fullchain.pem": [meta.certificate, meta.intermediate_certificate].filter(Boolean).join("\n"),
++		"privkey.pem": meta.certificate_key,
++	};
++	const installed = [];
++	let keepBackup = false;
++	try {
++		for (const [name, content] of Object.entries(files)) {
++			fs.writeFileSync(path.join(staging, name), content, { mode: 0o600 });
++		}
++		for (const name of Object.keys(files)) {
++			const live = path.join(dir, name);
++			const backup = path.join(staging, `${name}.old`);
++			const hadOriginal = fs.existsSync(live);
++			if (hadOriginal) {
++				fs.copyFileSync(live, backup);
++			}
++			fs.renameSync(path.join(staging, name), live);
++			installed.push({ live, backup, hadOriginal });
++		}
++		await apply();
++	} catch (err) {
++		keepBackup = true;
++		for (const { live, backup, hadOriginal } of installed.reverse()) {
++			if (hadOriginal) {
++				fs.renameSync(backup, live);
++			} else {
++				fs.unlinkSync(live);
++			}
++		}
++		keepBackup = false;
++		await afterRestore();
++		throw err;
++	} finally {
++		if (!keepBackup) {
++			fs.rmSync(staging, { recursive: true, force: true });
++		}
++	}
++}
+diff --git a/backend/routes/nginx/certificates.js b/backend/routes/nginx/certificates.js
+index 90f279c..a4ab92e 100644
+--- a/backend/routes/nginx/certificates.js
++++ b/backend/routes/nginx/certificates.js
+@@ -261,6 +261,7 @@ router
+ 
+ 		try {
+ 			const result = await internalCertificate.upload(res.locals.access, {
++				replaceChain: req.query.replace_chain === "true",
+ 				id: Number.parseInt(req.params.certificate_id, 10),
+ 				files: req.files,
+ 			});
+diff --git a/backend/schema/common.json b/backend/schema/common.json
+index 3b12bd1..8f2fffc 100644
+--- a/backend/schema/common.json
++++ b/backend/schema/common.json
+@@ -209,13 +209,13 @@
+ 			]
+ 		},
+ 		"certificate_files": {
+-			"description": "Certificate Files",
++			"description": "Certificate files. A key is required on first upload and optional when reusing an existing key.",
+ 			"content": {
+ 				"multipart/form-data": {
+ 					"schema": {
+ 						"type": "object",
+ 						"additionalProperties": false,
+-						"required": ["certificate", "certificate_key"],
++						"required": ["certificate"],
+ 						"properties": {
+ 							"certificate": {
+ 								"type": "string",
+diff --git a/backend/schema/paths/nginx/certificates/certID/upload/post.json b/backend/schema/paths/nginx/certificates/certID/upload/post.json
+index 2b1ba3e..c06f3cf 100644
+--- a/backend/schema/paths/nginx/certificates/certID/upload/post.json
++++ b/backend/schema/paths/nginx/certificates/certID/upload/post.json
+@@ -8,6 +8,12 @@
+ 		}
+ 	],
+ 	"parameters": [
++		{
++			"in": "query",
++			"name": "replace_chain",
++			"description": "Replace the intermediate chain. If no intermediate file is supplied, use only the uploaded certificate file.",
++			"schema": { "type": "boolean", "default": false }
++		},
+ 		{
+ 			"in": "path",
+ 			"name": "certID",
+@@ -39,7 +45,7 @@
+ 					"schema": {
+ 						"type": "object",
+ 						"additionalProperties": false,
+-						"required": ["certificate", "certificate_key"],
++						"required": ["certificate"],
+ 						"properties": {
+ 							"certificate": {
+ 								"type": "string",
+diff --git a/backend/test/custom-certificate-files.test.js b/backend/test/custom-certificate-files.test.js
+new file mode 100644
+index 0000000..65c1aa1
+--- /dev/null
++++ b/backend/test/custom-certificate-files.test.js
+@@ -0,0 +1,34 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { it } from "node:test";
++import { withCustomCertificateFiles } from "../internal/custom-certificate-files.js";
++
++it("restores both PEMs before recovering from a rejected replacement", async (t) => {
++	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "npm-cert-test-"));
++	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
++	const read = (name) => fs.readFileSync(path.join(dir, name), "utf8");
++	fs.writeFileSync(path.join(dir, "fullchain.pem"), "original chain");
++	fs.writeFileSync(path.join(dir, "privkey.pem"), "original key");
++	let restored = false;
++	await assert.rejects(
++		withCustomCertificateFiles(
++			dir,
++			{ certificate: "new leaf", certificate_key: "new key", intermediate_certificate: "new intermediate" },
++			async () => {
++				assert.equal(read("fullchain.pem"), "new leaf\nnew intermediate");
++				assert.equal(read("privkey.pem"), "new key");
++				throw new Error("reload failed");
++			},
++			async () => {
++				assert.equal(read("fullchain.pem"), "original chain");
++				assert.equal(read("privkey.pem"), "original key");
++				restored = true;
++			},
++		),
++		/reload failed/,
++	);
++	assert.ok(restored);
++	assert.deepEqual(fs.readdirSync(dir).sort(), ["fullchain.pem", "privkey.pem"]);
++});
+diff --git a/frontend/src/api/backend/uploadCertificate.ts b/frontend/src/api/backend/uploadCertificate.ts
+index b28c4e0..8cbf795 100644
+--- a/frontend/src/api/backend/uploadCertificate.ts
++++ b/frontend/src/api/backend/uploadCertificate.ts
+@@ -1,9 +1,10 @@
+ import * as api from "./base";
+ import type { Certificate } from "./models";
+ 
+-export async function uploadCertificate(id: number, data: FormData): Promise<Certificate> {
++export async function uploadCertificate(id: number, data: FormData, replaceChain = false): Promise<Certificate> {
+ 	return await api.post({
+ 		url: `/nginx/certificates/${id}/upload`,
++		params: replaceChain ? { replaceChain: true } : undefined,
+ 		data,
+ 	});
+ }
+diff --git a/frontend/src/locale/src/en.json b/frontend/src/locale/src/en.json
+index 8f7150a..45088fb 100644
+--- a/frontend/src/locale/src/en.json
++++ b/frontend/src/locale/src/en.json
+@@ -188,6 +188,12 @@
+ 	"certificates.custom": {
+ 		"defaultMessage": "Custom Certificate"
+ 	},
++	"certificates.custom.replace": {
++		"defaultMessage": "Replace Certificate"
++	},
++	"certificates.custom.replace-hint": {
++		"defaultMessage": "All hosts using this certificate will use the replacement. Leave the key empty to reuse the current key. Upload the complete chain in the certificate file or supply the new intermediate separately."
++	},
+ 	"certificates.custom.warning": {
+ 		"defaultMessage": "Key files protected with a passphrase are not supported."
+ 	},
+diff --git a/frontend/src/locale/src/et.json b/frontend/src/locale/src/et.json
+index 380fcec..e659f93 100644
+--- a/frontend/src/locale/src/et.json
++++ b/frontend/src/locale/src/et.json
+@@ -188,6 +188,12 @@
+ 	"certificates.custom": {
+ 		"defaultMessage": "Kohandatud sertifikaat"
+ 	},
++	"certificates.custom.replace": {
++		"defaultMessage": "Asenda sertifikaat"
++	},
++	"certificates.custom.replace-hint": {
++		"defaultMessage": "Uus sertifikaat rakendub kõigile seda sertifikaati kasutavatele hostidele. Senise privaatvõtme kasutamiseks jäta võtmeväli tühjaks. Lisa sertifikaadifaili kogu sertifikaadiahel või laadi uus vahesertifikaat üles eraldi."
++	},
+ 	"certificates.custom.warning": {
+ 		"defaultMessage": "Parooliga kaitstud võtmefaile ei toetata."
+ 	},
+diff --git a/frontend/src/locale/src/ko.json b/frontend/src/locale/src/ko.json
+index fc54b52..2217d10 100644
+--- a/frontend/src/locale/src/ko.json
++++ b/frontend/src/locale/src/ko.json
+@@ -188,6 +188,12 @@
+ 	"certificates.custom": {
+ 		"defaultMessage": "사용자 지정 인증서"
+ 	},
++	"certificates.custom.replace": {
++		"defaultMessage": "인증서 교체"
++	},
++	"certificates.custom.replace-hint": {
++		"defaultMessage": "이 인증서를 사용하는 모든 호스트에 적용됩니다. 개인 키를 비워 두면 기존 키를 사용합니다. 인증서 파일에 전체 체인을 포함하거나 새 중간 인증서를 함께 올려 주세요."
++	},
+ 	"certificates.custom.warning": {
+ 		"defaultMessage": "비밀번호로 보호된 키 파일은 지원되지 않습니다."
+ 	},
+diff --git a/frontend/src/locale/src/vi.json b/frontend/src/locale/src/vi.json
+index 53ee2e6..07d1a89 100644
+--- a/frontend/src/locale/src/vi.json
++++ b/frontend/src/locale/src/vi.json
+@@ -188,6 +188,12 @@
+ 	"certificates.custom": {
+ 		"defaultMessage": "Chứng chỉ tùy chỉnh"
+ 	},
++	"certificates.custom.replace": {
++		"defaultMessage": "Thay thế chứng chỉ"
++	},
++	"certificates.custom.replace-hint": {
++		"defaultMessage": "Tất cả máy chủ đang dùng chứng chỉ này sẽ sử dụng chứng chỉ mới. Để trống trường khóa để dùng lại khóa riêng hiện tại. Tải lên tệp chứng chỉ chứa toàn bộ chuỗi hoặc cung cấp riêng chứng chỉ trung gian mới."
++	},
+ 	"certificates.custom.warning": {
+ 		"defaultMessage": "Không hỗ trợ tệp khóa có đặt cụm mật khẩu bảo vệ."
+ 	},
+diff --git a/frontend/src/modals/CustomCertificateModal.test.tsx b/frontend/src/modals/CustomCertificateModal.test.tsx
+new file mode 100644
+index 0000000..eea4213
+--- /dev/null
++++ b/frontend/src/modals/CustomCertificateModal.test.tsx
+@@ -0,0 +1,34 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import EasyModal from "ez-modal-react";
++import { afterEach, expect, it, vi } from "vitest";
++import { showCustomCertificateModal } from "./CustomCertificateModal";
++
++afterEach(() => {
++	cleanup();
++	vi.unstubAllGlobals();
++});
++
++it("replaces the selected certificate without creating a record or sending a blank key", async () => {
++	const fetchMock = vi.fn().mockResolvedValue(new Response("{}"));
++	vi.stubGlobal("fetch", fetchMock);
++	render(
++		<QueryClientProvider client={new QueryClient()}>
++			<EasyModal.Provider />
++		</QueryClientProvider>,
++	);
++	await act(async () => {
++		showCustomCertificateModal({ id: 42, niceName: "shared wildcard" });
++	});
++	expect(await screen.findByDisplayValue("shared wildcard")).toHaveAttribute("readonly");
++	const certificate = new File(["renewed PEM"], "renewed.pem");
++	fireEvent.change(screen.getByLabelText("Certificate", { exact: true }), { target: { files: [certificate] } });
++	const form = screen.getByRole("button", { name: "Save" }).closest("form");
++	if (!form) throw new Error("Missing certificate form");
++	fireEvent.submit(form);
++	await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
++	const [url, request] = fetchMock.mock.calls[0];
++	expect(url).toBe("/api/nginx/certificates/42/upload?replace_chain=true");
++	expect(request.body.get("certificate").name).toBe("renewed.pem");
++	expect(request.body.has("certificate_key")).toBe(false);
++});
+diff --git a/frontend/src/modals/CustomCertificateModal.tsx b/frontend/src/modals/CustomCertificateModal.tsx
+index c373a8d..6238ea4 100644
+--- a/frontend/src/modals/CustomCertificateModal.tsx
++++ b/frontend/src/modals/CustomCertificateModal.tsx
+@@ -12,11 +12,15 @@ import { T } from "src/locale";
+ import { validateString } from "src/modules/Validations";
+ import { showObjectSuccess } from "src/notifications";
+ 
+-const showCustomCertificateModal = () => {
+-	EasyModal.show(CustomCertificateModal);
++interface Props extends InnerModalProps {
++	existing?: Pick<Certificate, "id" | "niceName">;
++}
++
++const showCustomCertificateModal = (existing?: Props["existing"]) => {
++	EasyModal.show(CustomCertificateModal, { existing });
+ };
+ 
+-const CustomCertificateModal = EasyModal.create(({ visible, remove }: InnerModalProps) => {
++const CustomCertificateModal = EasyModal.create(({ existing, visible, remove }: Props) => {
+ 	const queryClient = useQueryClient();
+ 	const [errorMsg, setErrorMsg] = useState<ReactNode | null>(null);
+ 	const [isSubmitting, setIsSubmitting] = useState(false);
+@@ -31,19 +35,21 @@ const CustomCertificateModal = EasyModal.create(({ visible, remove }: InnerModal
+ 			const formData = new FormData();
+ 
+ 			formData.append("certificate", certificate);
+-			formData.append("certificate_key", certificateKey);
++			if (certificateKey) {
++				formData.append("certificate_key", certificateKey);
++			}
+ 			if (intermediateCertificate !== null) {
+ 				formData.append("intermediate_certificate", intermediateCertificate);
+ 			}
+ 
+-			// Validate
+-			await validateCertificate(formData);
+-
+-			// Create certificate, as other without anything else
+-			const cert = await createCertificate({ niceName, provider } as Certificate);
+-
+-			// Upload the certificates to the created certificate
+-			await uploadCertificate(cert.id, formData);
++			if (existing) {
++				await uploadCertificate(existing.id, formData, true);
++				queryClient.invalidateQueries({ queryKey: ["certificate", existing.id] });
++			} else {
++				await validateCertificate(formData);
++				const cert = await createCertificate({ niceName, provider } as Certificate);
++				await uploadCertificate(cert.id, formData);
++			}
+ 
+ 			// Success
+ 			showObjectSuccess("certificate", "saved");
+@@ -64,7 +70,7 @@ const CustomCertificateModal = EasyModal.create(({ visible, remove }: InnerModal
+ 			preventHide={isSubmitting}
+ 			initialValues={
+ 				{
+-					niceName: "",
++					niceName: existing?.niceName ?? "",
+ 					provider: "other",
+ 					certificate: null,
+ 					certificateKey: null,
+@@ -77,7 +83,11 @@ const CustomCertificateModal = EasyModal.create(({ visible, remove }: InnerModal
+ 				<Form>
+ 					<Modal.Header closeButton>
+ 						<Modal.Title>
+-							<T id="object.add" tData={{ object: "certificates.custom" }} />
++							{existing ? (
++								<T id="certificates.custom.replace" />
++							) : (
++								<T id="object.add" tData={{ object: "certificates.custom" }} />
++							)}
+ 						</Modal.Title>
+ 					</Modal.Header>
+ 					<Modal.Body className="p-0">
+@@ -90,7 +100,12 @@ const CustomCertificateModal = EasyModal.create(({ visible, remove }: InnerModal
+ 									<IconAlertTriangle size={16} className="me-1" />
+ 									<T id="certificates.custom.warning" />
+ 								</p>
+-								<Field name="niceName" validate={validateString(1, 255)}>
++								{existing && (
++									<p>
++										<T id="certificates.custom.replace-hint" />
++									</p>
++								)}
++								<Field name="niceName" validate={existing ? undefined : validateString(1, 255)}>
+ 									{({ field, form }: any) => (
+ 										<div className="mb-3">
+ 											<label htmlFor="niceName" className="form-label">
+@@ -98,6 +113,7 @@ const CustomCertificateModal = EasyModal.create(({ visible, remove }: InnerModal
+ 											</label>
+ 											<input
+ 												id="niceName"
++												readOnly={!!existing}
+ 												type="text"
+ 												required
+ 												autoComplete="off"
+@@ -123,7 +139,7 @@ const CustomCertificateModal = EasyModal.create(({ visible, remove }: InnerModal
+ 											<input
+ 												id="certificateKey"
+ 												type="file"
+-												required
++												required={!existing}
+ 												autoComplete="off"
+ 												className="form-control"
+ 												onChange={(event) => {
+diff --git a/frontend/src/pages/Certificates/Table.tsx b/frontend/src/pages/Certificates/Table.tsx
+index 2312a9b..83e8695 100644
+--- a/frontend/src/pages/Certificates/Table.tsx
++++ b/frontend/src/pages/Certificates/Table.tsx
+@@ -117,18 +117,30 @@ export default function Table({ data, isFetching, onDelete, onRenew, onDownload,
+ 										data={{ id: info.row.original.id }}
+ 									/>
+ 								</span>
+-								<a
+-									className="dropdown-item"
+-									href="#"
+-									onClick={(e) => {
+-										e.preventDefault();
+-										onRenew?.(info.row.original.id);
+-									}}
+-								>
+-									<IconRefresh size={16} />
+-									<T id="action.renew" />
+-								</a>
++								{info.row.original.provider === "letsencrypt" && (
++									<a
++										className="dropdown-item"
++										href="#"
++										onClick={(e) => {
++											e.preventDefault();
++											onRenew?.(info.row.original.id);
++										}}
++									>
++										<IconRefresh size={16} />
++										<T id="action.renew" />
++									</a>
++								)}
+ 								<HasPermission section={CERTIFICATES} permission={MANAGE} hideError>
++									{info.row.original.provider === "other" && (
++										<button
++											type="button"
++											className="dropdown-item"
++											onClick={() => showCustomCertificateModal(info.row.original)}
++										>
++											<IconRefresh size={16} />
++											<T id="certificates.custom.replace" />
++										</button>
++									)}
+ 									<a
+ 										className="dropdown-item"
+ 										href="#"

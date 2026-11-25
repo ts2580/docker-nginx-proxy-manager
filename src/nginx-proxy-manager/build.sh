@@ -80,7 +80,7 @@ curl -# -L -f ${NGINX_PROXY_MANAGER_URL} | tar xz --strip 1 -C /tmp/nginx-proxy-
 sed -i "s/\"version\": \"[0-9]\+\.[0-9]\+\.[0-9]\+\",/\"version\": \"${NGINX_PROXY_MANAGER_VERSION}\",/" /tmp/nginx-proxy-manager/frontend/package.json
 sed -i "s/\"version\": \"[0-9]\+\.[0-9]\+\.[0-9]\+\",/\"version\": \"${NGINX_PROXY_MANAGER_VERSION}\",/" /tmp/nginx-proxy-manager/backend/package.json
 
-log "Patching Nginx Proxy Manager backend..."
+log "Patching Nginx Proxy Manager..."
 PATCHES="
     ip-ranges-fetch.patch \
     bcrypt.patch
@@ -88,7 +88,8 @@ PATCHES="
     certbot-command.patch
     certbot-disable-plugin-install.patch
     disable-remote-version-check.patch
-    template-root-dir.patch \
+    template-root-dir.patch
+    custom-certificate-replacement.patch \
 "
 for P in $PATCHES; do
     echo "Applying $P..."

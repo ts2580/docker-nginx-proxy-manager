@@ -91,6 +91,11 @@ app:
             - `CONTAINER_NAME` is the name of the running container.
             - `USER_EMAIL` is the email of the address to reset the password.
   changelog:
+    - version: 26.11.3
+      date: 2026-11-25
+      changes:
+        - 'Custom certificates can now be replaced in place from the certificate list. All hosts using the certificate pick up the replacement on reload.'
+        - 'The existing private key can be reused. If the replacement fails validation or Nginx cannot reload, the previous certificate remains available.'
     - version: 26.11.2
       date: 2026-11-25
       changes:
